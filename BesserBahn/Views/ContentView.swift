@@ -26,13 +26,13 @@ struct ContentView: View {
                 
                 // Journey Input
                 VStack(spacing: 16) {
-                    SPMStationField(
+                    StationSelector(
                         title: "From",
                         placeholder: "Select departure station",
                         selectedStation: $fromStation
                     )
                     
-                    SPMStationField(
+                    StationSelector(
                         title: "To",
                         placeholder: "Select destination station",
                         selectedStation: $toStation

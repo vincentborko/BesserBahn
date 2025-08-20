@@ -4,15 +4,6 @@ const { profile } = require('db-vendo-client/p/db/index.js');
 class DbService {
   constructor() {
     this.client = createClient(profile, 'BesserBahn-App');
-    
-    // Major German hubs for route splitting
-    this.MAJOR_HUBS = [
-      'Frankfurt am Main',
-      'Hannover',
-      'Nürnberg', 
-      'Köln',
-      'Hamburg'
-    ];
   }
 
   // Search for stations by name
@@ -45,7 +36,7 @@ class DbService {
       if (stations.length === 0) {
         throw new Error(`No station found for: ${cityName}`);
       }
-      console.log(`📍 ${cityName} → ${stations[0].name} (${stations[0].id})`);
+      console.log(`🔍 ${cityName} → ${stations[0].name} (${stations[0].id})`);
       return stations[0].id;
     } catch (error) {
       console.error(`❌ Station lookup failed for ${cityName}:`, error.message);
@@ -58,11 +49,12 @@ class DbService {
     try {
       console.log(`🔍 Searching: ${from} → ${to} at ${date} ${time}`);
       
-      // Convert city names to station IDs
+      // Convert city names to station IDs first
       const fromId = await this.getStationId(from);
       const toId = await this.getStationId(to);
       
-      // Convert to DateTime format expected by DB API
+      console.log(`🔍 Using station IDs: ${fromId} → ${toId}`);
+      
       const departureDateTime = new Date(`${date}T${time}`);
       
       const results = await this.client.journeys(fromId, toId, {
@@ -81,17 +73,42 @@ class DbService {
     }
   }
 
+  // FIXED: Better price extraction with proper validation
+  extractPrice(journey) {
+    if (!journey?.price) return null;
+    
+    // Based on debug output: { amount: 133.79, currency: 'EUR' }
+    if (journey.price.amount !== undefined) {
+      const price = Number(journey.price.amount);
+      return isNaN(price) ? null : price;
+    }
+    
+    // Fallback for other formats
+    if (typeof journey.price === 'number') {
+      return journey.price;
+    }
+    
+    console.warn('⚠️ Unknown price format:', journey.price);
+    return null;
+  }
+
   // Find the cheapest journey from a list
   findCheapestJourney(journeys) {
     if (!journeys || journeys.length === 0) return null;
     
-    const withPrices = journeys.filter(journey => 
-      journey.price && journey.price.amount
-    );
+    const withPrices = journeys
+      .map(journey => ({
+        ...journey,
+        extractedPrice: this.extractPrice(journey)
+      }))
+      .filter(journey => journey.extractedPrice !== null && !isNaN(journey.extractedPrice));
     
-    if (withPrices.length === 0) return null;
+    if (withPrices.length === 0) {
+      console.warn('⚠️ No journeys with valid prices found');
+      return null;
+    }
     
-    return withPrices.sort((a, b) => a.price.amount - b.price.amount)[0];
+    return withPrices.sort((a, b) => a.extractedPrice - b.extractedPrice)[0];
   }
 
   // Calculate duration from journey legs
@@ -107,20 +124,53 @@ class DbService {
     return `${hours}h ${minutes}m`;
   }
 
-  // Main method to find all route options
+  // NEW: Extract intermediate stations from a journey route
+  extractIntermediateStations(directJourney, maxStations = 3) {
+    if (!directJourney?.legs) return [];
+    
+    const intermediateStations = [];
+    
+    for (const leg of directJourney.legs) {
+      if (leg.stopovers) {
+        // Add major stops (longer stop times indicate importance)
+        leg.stopovers.forEach(stop => {
+          if (stop.stop?.name && stop.plannedDeparture && stop.plannedArrival) {
+            const stopDuration = new Date(stop.plannedDeparture) - new Date(stop.plannedArrival);
+            // Only consider stops with at least 2 minutes (indicates station, not just signal stop)
+            if (stopDuration >= 120000) {
+              intermediateStations.push({
+                name: stop.stop.name,
+                id: stop.stop.id,
+                stopDuration
+              });
+            }
+          }
+        });
+      }
+    }
+    
+    // Sort by stop duration (longer stops = more important stations) and limit
+    return intermediateStations
+      .sort((a, b) => b.stopDuration - a.stopDuration)
+      .slice(0, maxStations)
+      .map(station => station.name);
+  }
+
+  // NEW: Smart route splitting using actual route data
   async findRouteOptions(fromCity, toCity, date, time) {
     const results = [];
 
-    // 1. Search direct route
+    // 1. Get direct route first
+    let directJourney = null;
     try {
       const directJourneys = await this.searchConnection(fromCity, toCity, date, time);
-      const directBest = this.findCheapestJourney(directJourneys);
+      directJourney = this.findCheapestJourney(directJourneys);
       
-      if (directBest) {
+      if (directJourney) {
         results.push({
           route: 'Direct',
-          price: directBest.price.amount, // Don't divide by 100 - already in euros
-          duration: this.calculateDuration(directBest.legs),
+          price: directJourney.extractedPrice,
+          duration: this.calculateDuration(directJourney.legs),
           details: 'No connections',
           connections: 0
         });
@@ -129,53 +179,61 @@ class DbService {
       console.error('Direct route failed:', error.message);
     }
 
-    // 2. Search via hubs (simplified for testing - just try first 2 hubs)
-    for (const hub of this.MAJOR_HUBS.slice(0, 2)) {
-      try {
-        await this.searchViaHub(fromCity, toCity, hub, date, time, results);
-      } catch (error) {
-        console.error(`Hub ${hub} failed:`, error.message);
+    // 2. If we have a direct route, try splitting at intermediate stations
+    if (directJourney) {
+      const intermediateStations = this.extractIntermediateStations(directJourney);
+      console.log(`🔍 Found ${intermediateStations.length} intermediate stations:`, intermediateStations);
+      
+      for (const station of intermediateStations) {
+        try {
+          await this.searchViaStation(fromCity, toCity, station, date, time, results);
+        } catch (error) {
+          console.error(`Station ${station} failed:`, error.message);
+        }
       }
     }
 
-    // Sort by price
-    results.sort((a, b) => a.price - b.price);
-    
-    return results;
+    // Sort by price and return
+    return results
+      .filter(result => result.price && !isNaN(result.price))
+      .sort((a, b) => a.price - b.price);
   }
 
-  // Search via a specific hub
-  async searchViaHub(fromCity, toCity, hubCity, date, time, results) {
-    // First leg: origin → hub
-    const firstLeg = await this.searchConnection(fromCity, hubCity, date, time);
+  // Search via a specific intermediate station
+  async searchViaStation(fromCity, toCity, viaStation, date, time, results) {
+    // First leg: origin → via
+    const firstLeg = await this.searchConnection(fromCity, viaStation, date, time);
     const firstBest = this.findCheapestJourney(firstLeg);
     
     if (!firstBest) return;
 
-    // Calculate connection time at hub
-    const hubArrival = new Date(firstBest.legs[firstBest.legs.length - 1].arrival);
-    hubArrival.setMinutes(hubArrival.getMinutes() + 30); // 30min buffer
+    // Calculate connection time
+    const viaArrival = new Date(firstBest.legs[firstBest.legs.length - 1].arrival);
+    viaArrival.setMinutes(viaArrival.getMinutes() + 15); // Shorter buffer for actual route stations
     
-    const hubTime = hubArrival.toTimeString().slice(0, 5);
-    const hubDate = hubArrival.toISOString().split('T')[0];
+    const viaTime = viaArrival.toTimeString().slice(0, 5);
+    const viaDate = viaArrival.toISOString().split('T')[0];
 
-    // Second leg: hub → destination  
-    const secondLeg = await this.searchConnection(hubCity, toCity, hubDate, hubTime);
+    // Second leg: via → destination  
+    const secondLeg = await this.searchConnection(viaStation, toCity, viaDate, viaTime);
     const secondBest = this.findCheapestJourney(secondLeg);
     
     if (!secondBest) return;
 
-    const totalPrice = (firstBest.price.amount + secondBest.price.amount); // Don't divide by 100
+    const totalPrice = firstBest.extractedPrice + secondBest.extractedPrice;
     const directPrice = results.find(r => r.route === 'Direct')?.price;
     const savings = directPrice ? directPrice - totalPrice : 0;
 
-    results.push({
-      route: `Via ${hubCity}`,
-      price: totalPrice,
-      duration: this.calculateTotalDuration(firstBest, secondBest),
-      details: `1 connection${savings > 0 ? ` • Save €${savings.toFixed(2)}` : ''}`,
-      connections: 1
-    });
+    // Only add if there are actual savings
+    if (savings > 0) {
+      results.push({
+        route: `Via ${viaStation}`,
+        price: totalPrice,
+        duration: this.calculateTotalDuration(firstBest, secondBest),
+        details: `1 connection • Save €${savings.toFixed(2)}`,
+        connections: 1
+      });
+    }
   }
 
   // Calculate total duration for multi-leg journey

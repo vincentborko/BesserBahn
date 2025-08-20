@@ -1,11 +1,3 @@
-//
-//  Journey.swift
-//  BesserBahn
-//
-//  Created by Vincent Borko on 19.08.25.
-//
-
-
 import Foundation
 
 struct Journey {
